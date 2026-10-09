@@ -1,0 +1,2568 @@
+import { router } from "expo-router";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import {
+  Alert,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  RefreshControl,
+  ScrollView,
+  Share,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
+
+import AppButton from "../components/AppButton";
+import {
+  ADMIN_TABS,
+  buildAdminMetrics,
+  buildCsvContent,
+  buildMenuSections,
+  buildOrdersByStatus,
+  buildOrdersPerDay,
+  buildQueueHeadline,
+  buildVolunteerStats,
+  formatElapsedSince,
+  formatQueueAge,
+  generateMenuItemKey,
+  getCustomerLabel,
+  getOrderStatusBadge,
+  getOrderSummary,
+  getReportReasonMeta,
+  getReportStatusMeta,
+  isComplaintOpen,
+  isOrderCancellable,
+} from "../lib/adminDashboard";
+import { deleteOrderById } from "../lib/orderDeletion";
+import { supabase } from "../services/supabase";
+import { theme } from "../theme";
+
+const ADMIN_USERNAME = "admin";
+const ADMIN_PASSWORD = "password";
+const ADMIN_AUTH_STORAGE_KEY = "admin-dashboard-authenticated";
+
+const TAB_COPY = {
+  menu: {
+    title: "Menu setup",
+    subtitle: "Requester-facing menu sections and available items.",
+  },
+  pantries: {
+    title: "Pantry locations",
+    subtitle: "Distribution sites shown on the volunteer map.",
+  },
+  cancellations: {
+    title: "Order cancellations",
+    subtitle: "Pending and accepted orders flagged for removal.",
+  },
+  complaints: {
+    title: "Complaint handling",
+    subtitle: "Open reports from requesters and volunteers.",
+  },
+  analytics: {
+    title: "Analytics",
+    subtitle: "Order volume, status mix, daily trends, and volunteer activity.",
+  },
+  history: {
+    title: "Order history",
+    subtitle: "Order records with date filters and CSV export.",
+  },
+};
+
+function formatPersonName(row) {
+  const first = String(row?.first_name ?? "").trim();
+  const last = String(row?.last_name ?? "").trim();
+  return [first, last].filter(Boolean).join(" ") || "";
+}
+
+function formatTimestamp(value) {
+  if (!value) return "Unknown time";
+  return new Date(value).toLocaleString();
+}
+
+function buildAddressSummary(value) {
+  if (!value) return "No address saved";
+  return String(value);
+}
+
+function buildProfileMap(rows) {
+  return Object.fromEntries(
+    (rows ?? []).map((row) => [row.uid, formatPersonName(row)]),
+  );
+}
+
+export default function AdminDashboard() {
+  const [authReady, setAuthReady] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [credentials, setCredentials] = useState({
+    username: "",
+    password: "",
+  });
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [busyKey, setBusyKey] = useState("");
+  const [historyFilter, setHistoryFilter] = useState({ from: "", to: "" });
+  const [lastRefreshedAt, setLastRefreshedAt] = useState(null);
+  const [activeTab, setActiveTab] = useState("menu");
+  const [focusedComplaint, setFocusedComplaint] = useState(null);
+  const [sectionEditor, setSectionEditor] = useState(null);
+  const [itemEditor, setItemEditor] = useState(null);
+  const [pantryEditor, setPantryEditor] = useState(null);
+  const [dashboardData, setDashboardData] = useState({
+    orders: [],
+    reports: [],
+    itemCatalog: [],
+    customersById: {},
+    volunteersById: {},
+    pantries: [],
+  });
+
+  const loadDashboard = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setLoading(true);
+    }
+
+    try {
+      const [
+        ordersResult,
+        reportsResult,
+        itemsResult,
+        customersResult,
+        volunteersResult,
+        pantriesResult,
+      ] = await Promise.all([
+        supabase
+          .from("orders")
+          .select(
+            `
+              order_id,
+              name,
+              status,
+              created_at,
+              delivery_address,
+              customer_uid,
+              volunteer_uid,
+              box_count,
+              notes,
+              boxes (
+                box_id,
+                box_number,
+                order_items (
+                  item_id,
+                  items (
+                    label,
+                    category
+                  )
+                )
+              )
+            `,
+          )
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("reports")
+          .select(
+            `
+              report_id,
+              order_id,
+              reporter_id,
+              reported_id,
+              reporter_role,
+              reported_role,
+              reason,
+              description,
+              status,
+              created_at
+            `,
+          )
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("items")
+          .select("id, key, label, category, active")
+          .order("category", { ascending: true })
+          .order("label", { ascending: true }),
+        supabase.from("customers").select("uid, first_name, last_name"),
+        supabase.from("volunteers").select("uid, first_name, last_name"),
+        supabase
+          .from("pantries")
+          .select("id, name, address, hours, active")
+          .order("name", { ascending: true }),
+      ]);
+
+      const possibleErrors = [
+        ordersResult.error,
+        reportsResult.error,
+        itemsResult.error,
+        customersResult.error,
+        volunteersResult.error,
+      ].filter(Boolean);
+
+      if (possibleErrors.length > 0) {
+        throw new Error(possibleErrors[0].message);
+      }
+
+      setDashboardData({
+        orders: ordersResult.data ?? [],
+        reports: reportsResult.data ?? [],
+        itemCatalog: itemsResult.data ?? [],
+        customersById: buildProfileMap(customersResult.data),
+        volunteersById: buildProfileMap(volunteersResult.data),
+        pantries: pantriesResult.error ? [] : (pantriesResult.data ?? []),
+      });
+      setLastRefreshedAt(new Date().toISOString());
+    } catch (error) {
+      console.error("Error loading admin dashboard:", error);
+      Alert.alert(
+        "Unable to Load Admin Dashboard",
+        error.message || "Please try refreshing again.",
+      );
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const restoreAdminSession = async () => {
+      try {
+        const savedValue = await AsyncStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
+
+        if (isMounted) {
+          setIsAuthenticated(savedValue === "true");
+        }
+      } catch (error) {
+        console.error("Error restoring admin auth:", error);
+      } finally {
+        if (isMounted) {
+          setAuthReady(true);
+        }
+      }
+    };
+
+    restoreAdminSession();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || !isAuthenticated) {
+      return;
+    }
+
+    loadDashboard();
+  }, [authReady, isAuthenticated, loadDashboard]);
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await loadDashboard({ silent: true });
+  };
+
+  const handleLogin = async () => {
+    const username = credentials.username.trim();
+    const password = credentials.password;
+
+    if (!username || !password) {
+      setLoginError("Enter the admin username and password.");
+      return;
+    }
+
+    if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+      setLoginError("Incorrect username or password.");
+      return;
+    }
+
+    setAuthBusy(true);
+    setLoginError("");
+
+    try {
+      await AsyncStorage.setItem(ADMIN_AUTH_STORAGE_KEY, "true");
+      setIsAuthenticated(true);
+      setCredentials({
+        username: "",
+        password: "",
+      });
+    } catch (error) {
+      console.error("Error saving admin auth:", error);
+      setLoginError("Unable to save the admin session. Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setAuthBusy(true);
+
+    try {
+      await AsyncStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+      setIsAuthenticated(false);
+      setLoginError("");
+      setCredentials({
+        username: "",
+        password: "",
+      });
+      router.replace("/mode-select");
+    } catch (error) {
+      console.error("Error clearing admin auth:", error);
+      Alert.alert("Unable to Log Out", "Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const metrics = useMemo(
+    () =>
+      buildAdminMetrics(
+        dashboardData.orders,
+        dashboardData.reports,
+        dashboardData.itemCatalog,
+      ),
+    [dashboardData.orders, dashboardData.reports, dashboardData.itemCatalog],
+  );
+
+  const metricCards = useMemo(
+    () =>
+      metrics.filter((metric) =>
+        ["liveSections", "liveItems", "cancellations", "openComplaints"].includes(
+          metric.key,
+        ),
+      ),
+    [metrics],
+  );
+
+  const queueHeadline = useMemo(() => buildQueueHeadline(metrics), [metrics]);
+
+  const menuSections = useMemo(
+    () => buildMenuSections(dashboardData.itemCatalog),
+    [dashboardData.itemCatalog],
+  );
+
+  const ordersById = useMemo(
+    () => Object.fromEntries(dashboardData.orders.map((order) => [order.order_id, order])),
+    [dashboardData.orders],
+  );
+
+  const cancellationQueue = useMemo(
+    () =>
+      dashboardData.orders
+        .filter((order) => isOrderCancellable(order.status))
+        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
+    [dashboardData.orders],
+  );
+
+  const volunteerStats = useMemo(
+    () => buildVolunteerStats(dashboardData.orders, dashboardData.volunteersById),
+    [dashboardData.orders, dashboardData.volunteersById],
+  );
+
+  const ordersByStatus = useMemo(
+    () => buildOrdersByStatus(dashboardData.orders),
+    [dashboardData.orders],
+  );
+
+  const ordersPerDay = useMemo(
+    () => buildOrdersPerDay(dashboardData.orders, 7),
+    [dashboardData.orders],
+  );
+
+  const filteredHistoryOrders = useMemo(() => {
+    const fromDate = historyFilter.from ? new Date(historyFilter.from) : null;
+    const toDate = historyFilter.to ? new Date(historyFilter.to) : null;
+    if (toDate) toDate.setHours(23, 59, 59, 999);
+
+    return [...dashboardData.orders]
+      .filter((order) => {
+        const t = new Date(order.created_at);
+        if (fromDate && t < fromDate) return false;
+        if (toDate && t > toDate) return false;
+        return true;
+      })
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  }, [dashboardData.orders, historyFilter]);
+
+  const complaintQueue = useMemo(() => {
+    const severityRank = {
+      High: 0,
+      Medium: 1,
+      Low: 2,
+    };
+
+    return dashboardData.reports
+      .filter((report) => isComplaintOpen(report.status))
+      .sort((a, b) => {
+        const aSeverity = getReportReasonMeta(a.reason).severity;
+        const bSeverity = getReportReasonMeta(b.reason).severity;
+        const severityDiff =
+          (severityRank[aSeverity] ?? 99) - (severityRank[bSeverity] ?? 99);
+
+        if (severityDiff !== 0) {
+          return severityDiff;
+        }
+
+        return new Date(a.created_at) - new Date(b.created_at);
+      });
+  }, [dashboardData.reports]);
+
+  const currentTabCopy = TAB_COPY[activeTab];
+  const currentSection = useMemo(() => {
+    if (sectionEditor?.mode !== "manage") {
+      return null;
+    }
+
+    return (
+      menuSections.find((section) => section.name === sectionEditor.originalName) || null
+    );
+  }, [menuSections, sectionEditor]);
+
+  const openCreateSection = () => {
+    setSectionEditor({
+      mode: "create",
+      originalName: "",
+      name: "",
+      firstItemLabel: "",
+    });
+  };
+
+  const openManageSection = (section) => {
+    setSectionEditor({
+      mode: "manage",
+      originalName: section.name,
+      name: section.name,
+      firstItemLabel: "",
+    });
+  };
+
+  const closeSectionEditor = () => {
+    if (busyKey === "section-save" || busyKey === "item-save") {
+      return;
+    }
+
+    setItemEditor(null);
+    setSectionEditor(null);
+  };
+
+  const openCreateItem = (sectionName) => {
+    setItemEditor({
+      mode: "create",
+      sectionName,
+      itemId: null,
+      label: "",
+      active: true,
+    });
+  };
+
+  const openEditItem = (item) => {
+    setItemEditor({
+      mode: "edit",
+      sectionName: item.category || "Other",
+      itemId: item.id,
+      label: item.label || "",
+      active: item.active !== false,
+    });
+  };
+
+  const closeItemEditor = () => {
+    if (busyKey === "item-save") {
+      return;
+    }
+
+    setItemEditor(null);
+  };
+
+  const performSectionVisibilityUpdate = async (section, nextActive) => {
+    setBusyKey(`section-toggle-${section.name}`);
+
+    try {
+      const { error } = await supabase
+        .from("items")
+        .update({ active: nextActive })
+        .eq("category", section.name);
+
+      if (error) {
+        throw error;
+      }
+
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error updating section visibility:", error);
+      Alert.alert(
+        nextActive ? "Unable to Restore Section" : "Unable to Hide Section",
+        error.message || "Please try again.",
+      );
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const handleSaveSection = async () => {
+    if (!sectionEditor) {
+      return;
+    }
+
+    const trimmedName = sectionEditor.name.trim();
+    if (!trimmedName) {
+      Alert.alert("Missing Section Name", "Please enter a section name.");
+      return;
+    }
+
+    const isDuplicate = menuSections.some((section) => {
+      if (sectionEditor.mode === "manage" && section.name === sectionEditor.originalName) {
+        return false;
+      }
+
+      return section.name.toLowerCase() === trimmedName.toLowerCase();
+    });
+
+    if (isDuplicate) {
+      Alert.alert(
+        "Section Already Exists",
+        "Choose a different section name to avoid merging menu groups by accident.",
+      );
+      return;
+    }
+
+    setBusyKey("section-save");
+
+    try {
+      if (sectionEditor.mode === "create") {
+        const firstItemLabel = sectionEditor.firstItemLabel.trim();
+
+        if (!firstItemLabel) {
+          throw new Error("Add one item label to create a section.");
+        }
+
+        const { error } = await supabase.from("items").insert({
+          key: generateMenuItemKey(firstItemLabel),
+          label: firstItemLabel,
+          category: trimmedName,
+          active: true,
+        });
+
+        if (error) {
+          throw error;
+        }
+      } else if (trimmedName !== sectionEditor.originalName) {
+        const { error } = await supabase
+          .from("items")
+          .update({ category: trimmedName })
+          .eq("category", sectionEditor.originalName);
+
+        if (error) {
+          throw error;
+        }
+      }
+
+      setSectionEditor(null);
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error saving section:", error);
+      Alert.alert(
+        "Unable to Save Section",
+        error.message || "Please try again.",
+      );
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const handleSaveItem = async () => {
+    if (!itemEditor) {
+      return;
+    }
+
+    const trimmedLabel = itemEditor.label.trim();
+    if (!trimmedLabel) {
+      Alert.alert("Missing Item Label", "Please enter an item label.");
+      return;
+    }
+
+    setBusyKey("item-save");
+
+    try {
+      if (itemEditor.mode === "create") {
+        const { error } = await supabase.from("items").insert({
+          key: generateMenuItemKey(trimmedLabel),
+          label: trimmedLabel,
+          category: itemEditor.sectionName,
+          active: true,
+        });
+
+        if (error) {
+          throw error;
+        }
+      } else {
+        const { error } = await supabase
+          .from("items")
+          .update({ label: trimmedLabel })
+          .eq("id", itemEditor.itemId);
+
+        if (error) {
+          throw error;
+        }
+      }
+
+      setItemEditor(null);
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error saving item:", error);
+      Alert.alert("Unable to Save Item", error.message || "Please try again.");
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const handleToggleItemVisibility = async (item, nextActive) => {
+    setBusyKey(`item-toggle-${item.id}`);
+
+    try {
+      const { error } = await supabase
+        .from("items")
+        .update({ active: nextActive })
+        .eq("id", item.id);
+
+      if (error) {
+        throw error;
+      }
+
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error updating item visibility:", error);
+      Alert.alert(
+        nextActive ? "Unable to Restore Item" : "Unable to Hide Item",
+        error.message || "Please try again.",
+      );
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const performCancelOrder = async (order) => {
+    setBusyKey(`cancel-${order.order_id}`);
+
+    try {
+      await deleteOrderById(order.order_id);
+
+      if (focusedComplaint?.order_id === order.order_id) {
+        setFocusedComplaint(null);
+      }
+
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error cancelling order:", error);
+      Alert.alert("Order Cancellation Failed", error.message || "Please try again.");
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const openCreatePantry = () => {
+    setPantryEditor({ mode: "create", id: null, name: "", address: "", hours: "" });
+  };
+
+  const openEditPantry = (pantry) => {
+    setPantryEditor({
+      mode: "edit",
+      id: pantry.id,
+      name: pantry.name,
+      address: pantry.address,
+      hours: pantry.hours ?? "",
+    });
+  };
+
+  const closePantryEditor = () => {
+    if (busyKey === "pantry-save") return;
+    setPantryEditor(null);
+  };
+
+  const handleSavePantry = async () => {
+    if (!pantryEditor) return;
+
+    const name = pantryEditor.name.trim();
+    const address = pantryEditor.address.trim();
+    const hours = pantryEditor.hours.trim();
+
+    if (!name) {
+      Alert.alert("Missing Name", "Please enter the pantry name.");
+      return;
+    }
+
+    if (!address) {
+      Alert.alert("Missing Address", "Please enter the pantry address.");
+      return;
+    }
+
+    setBusyKey("pantry-save");
+
+    try {
+      if (pantryEditor.mode === "create") {
+        const { error } = await supabase
+          .from("pantries")
+          .insert({ name, address, hours, active: true });
+
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from("pantries")
+          .update({ name, address, hours })
+          .eq("id", pantryEditor.id);
+
+        if (error) throw error;
+      }
+
+      setPantryEditor(null);
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error saving pantry:", error);
+      Alert.alert("Unable to Save Pantry", error.message || "Please try again.");
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const handleTogglePantryActive = async (pantry, nextActive) => {
+    setBusyKey(`pantry-toggle-${pantry.id}`);
+
+    try {
+      const { error } = await supabase
+        .from("pantries")
+        .update({ active: nextActive })
+        .eq("id", pantry.id);
+
+      if (error) throw error;
+
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error updating pantry visibility:", error);
+      Alert.alert(
+        nextActive ? "Unable to Restore Pantry" : "Unable to Deactivate Pantry",
+        error.message || "Please try again.",
+      );
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const performDeletePantry = async (pantry) => {
+    setBusyKey(`pantry-delete-${pantry.id}`);
+
+    try {
+      const { error } = await supabase
+        .from("pantries")
+        .delete()
+        .eq("id", pantry.id);
+
+      if (error) throw error;
+
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error deleting pantry:", error);
+      Alert.alert("Unable to Delete Pantry", error.message || "Please try again.");
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const handleDeletePantry = (pantry) => {
+    Alert.alert(
+      "Delete this pantry?",
+      `${pantry.name} will be removed from the volunteer map permanently.`,
+      [
+        { text: "Keep", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => void performDeletePantry(pantry),
+        },
+      ],
+    );
+  };
+
+  const handleCancelOrder = (order) => {
+    const customerLabel = getCustomerLabel(order, dashboardData.customersById);
+    const volunteerLabel = order.volunteer_uid
+      ? dashboardData.volunteersById[order.volunteer_uid]
+      : "";
+    const detail = volunteerLabel
+      ? `This also clears the assignment for ${volunteerLabel}.`
+      : "This removes the order from the active queue.";
+
+    Alert.alert(
+      "Cancel this order?",
+      `${customerLabel}'s order will be removed.\n\n${detail}`,
+      [
+        {
+          text: "Keep order",
+          style: "cancel",
+        },
+        {
+          text: "Cancel order",
+          style: "destructive",
+          onPress: () => {
+            void performCancelOrder(order);
+          },
+        },
+      ],
+    );
+  };
+
+  const handleSetReportStatus = async (report, nextStatus) => {
+    setBusyKey(`report-${report.order_id}-${nextStatus}`);
+
+    try {
+      const { data, error } = await supabase
+      .from("reports")
+      .update({ status: nextStatus })
+      .eq("report_id", report.report_id)
+      .select("report_id, status");
+
+      if (error) {
+        throw error;
+      }
+
+      if (!data || data.length === 0) {
+        throw new Error("No matching complaint was updated.");
+      }
+
+      setFocusedComplaint(null);
+      setDashboardData((current) => ({
+        ...current,
+        reports: current.reports.map((entry) => {
+          const matchesOrder = entry.order_id === report.order_id;
+          const matchesReporter = entry.reporter_id === report.reporter_id;
+          const matchesCreatedAt = report.created_at
+            ? entry.created_at === report.created_at
+            : true;
+
+          if (!matchesOrder || !matchesReporter || !matchesCreatedAt) {
+            return entry;
+          }
+
+          return {
+            ...entry,
+            status: nextStatus,
+          };
+        }),
+      }));
+      await loadDashboard({ silent: true });
+    } catch (error) {
+      console.error("Error updating report status:", error);
+      Alert.alert("Complaint Update Failed", error.message || "Please try again.");
+    } finally {
+      setBusyKey("");
+    }
+  };
+
+  const renderMenuSectionCard = (section) => {
+    const previewItems = section.items
+      .filter((item) => item.active)
+      .slice(0, 4)
+      .map((item) => item.label);
+    const previewText =
+      previewItems.length > 0
+        ? previewItems.join(", ")
+        : "No live items are currently visible to requesters.";
+
+    return (
+      <View key={section.name} style={styles.queueCard}>
+        <View style={styles.queueCardHeader}>
+          <View style={styles.queueCardTitleBlock}>
+            <Text style={styles.queueCardTitle}>{section.name}</Text>
+            <Text style={styles.queueCardMeta}>
+              {section.activeItemCount} live item
+              {section.activeItemCount === 1 ? "" : "s"}
+              {section.inactiveItemCount > 0
+                ? ` • ${section.inactiveItemCount} hidden`
+                : ""}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.badge,
+              section.isVisible ? styles.badgeVisible : styles.badgeMuted,
+            ]}
+          >
+            <Text style={styles.badgeText}>
+              {section.isVisible ? "Visible" : "Hidden"}
+            </Text>
+          </View>
+        </View>
+
+        <Text style={styles.queueLabel}>Requester view</Text>
+        <Text style={styles.queueValue}>{previewText}</Text>
+
+        <Text style={styles.queueLabel}>Visibility</Text>
+        <Text style={styles.queueValue}>
+          {section.isVisible
+            ? "Shown while at least one item is live."
+            : "Hidden until an item is restored."}
+        </Text>
+
+        <View style={styles.actionRow}>
+          <AppButton
+            title="Edit Section"
+            onPress={() => openManageSection(section)}
+            style={styles.inlineAction}
+          />
+          <AppButton
+            title={section.isVisible ? "Hide Section" : "Restore All"}
+            variant="ghost"
+            onPress={() => performSectionVisibilityUpdate(section, !section.isVisible)}
+            disabled={busyKey === `section-toggle-${section.name}`}
+            style={styles.inlineAction}
+          />
+        </View>
+      </View>
+    );
+  };
+
+  const renderPantryCard = (pantry) => (
+    <View key={pantry.id} style={styles.queueCard}>
+      <View style={styles.queueCardHeader}>
+        <View style={styles.queueCardTitleBlock}>
+          <Text style={styles.queueCardTitle}>{pantry.name}</Text>
+          <Text style={styles.queueCardMeta}>{pantry.hours || "Hours not set"}</Text>
+        </View>
+        <View style={[styles.badge, pantry.active ? styles.badgeVisible : styles.badgeMuted]}>
+          <Text style={styles.badgeText}>{pantry.active ? "Active" : "Inactive"}</Text>
+        </View>
+      </View>
+
+      <Text style={styles.queueLabel}>Address</Text>
+      <Text style={styles.queueValue}>{pantry.address}</Text>
+
+      <View style={styles.pantryActionRow}>
+        <AppButton
+          title="Edit"
+          onPress={() => openEditPantry(pantry)}
+          style={styles.inlineAction}
+        />
+        <AppButton
+          title={pantry.active ? "Deactivate" : "Restore"}
+          variant="ghost"
+          onPress={() => handleTogglePantryActive(pantry, !pantry.active)}
+          disabled={busyKey === `pantry-toggle-${pantry.id}`}
+          style={styles.inlineAction}
+        />
+        <AppButton
+          title="Delete"
+          variant="danger"
+          onPress={() => handleDeletePantry(pantry)}
+          disabled={busyKey === `pantry-delete-${pantry.id}`}
+          style={styles.inlineAction}
+        />
+      </View>
+    </View>
+  );
+
+  const renderCancellationCard = (order) => {
+    const statusMeta = getOrderStatusBadge(order);
+    const summary = getOrderSummary(order);
+    const customerLabel = getCustomerLabel(order, dashboardData.customersById);
+    const volunteerLabel = order.volunteer_uid
+      ? dashboardData.volunteersById[order.volunteer_uid]
+      : "";
+
+    return (
+      <View key={`cancel-${order.order_id}`} style={styles.queueCard}>
+        <View style={styles.queueCardHeader}>
+          <View style={styles.queueCardTitleBlock}>
+            <Text style={styles.queueCardTitle}>{customerLabel}</Text>
+            <Text style={styles.queueCardMeta}>
+              Order #{order.order_id} • {formatQueueAge(order.created_at)}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.badge,
+              {
+                backgroundColor: statusMeta.backgroundColor,
+                borderColor: statusMeta.borderColor,
+              },
+            ]}
+          >
+            <Text style={styles.badgeText}>{statusMeta.label}</Text>
+          </View>
+        </View>
+
+        <Text style={styles.queueLabel}>Menu snapshot</Text>
+        <Text style={styles.queueValue}>
+          {summary.boxCount} box{summary.boxCount === 1 ? "" : "es"} •{" "}
+          {summary.itemLabels.length > 0
+            ? summary.itemLabels.slice(0, 4).join(", ")
+            : "No item selections saved yet."}
+        </Text>
+
+        <Text style={styles.queueLabel}>Delivery address</Text>
+        <Text style={styles.queueValue}>
+          {buildAddressSummary(order.delivery_address)}
+        </Text>
+
+        {volunteerLabel ? (
+          <>
+            <Text style={styles.queueLabel}>Assigned volunteer</Text>
+            <Text style={styles.queueValue}>{volunteerLabel}</Text>
+          </>
+        ) : null}
+
+        {summary.specialInstructions ? (
+          <>
+            <Text style={styles.queueLabel}>Special instructions</Text>
+            <Text style={styles.queueValue}>{summary.specialInstructions}</Text>
+          </>
+        ) : null}
+
+        <View style={styles.actionRow}>
+          <AppButton
+            title="Cancel Order"
+            variant="secondary"
+            onPress={() => handleCancelOrder(order)}
+            disabled={busyKey === `cancel-${order.order_id}`}
+            style={styles.inlineAction}
+          />
+        </View>
+      </View>
+    );
+  };
+
+  const renderComplaintCard = (report) => {
+    const reasonMeta = getReportReasonMeta(report.reason);
+    const statusMeta = getReportStatusMeta(report.status);
+    const relatedOrder = ordersById[report.order_id];
+    const customerLabel = relatedOrder
+      ? getCustomerLabel(relatedOrder, dashboardData.customersById)
+      : `Order #${report.order_id}`;
+
+    return (
+      <View key={`${report.order_id}-${report.created_at}`} style={styles.queueCard}>
+        <View style={styles.queueCardHeader}>
+          <View style={styles.queueCardTitleBlock}>
+            <Text style={styles.queueCardTitle}>{reasonMeta.label}</Text>
+            <Text style={styles.queueCardMeta}>
+              {customerLabel} • {formatQueueAge(report.created_at)}
+            </Text>
+          </View>
+          <View style={styles.complaintBadges}>
+            <View
+              style={[
+                styles.badge,
+                {
+                  backgroundColor: reasonMeta.backgroundColor,
+                  borderColor: reasonMeta.borderColor,
+                },
+              ]}
+            >
+              <Text style={styles.badgeText}>{reasonMeta.severity}</Text>
+            </View>
+            <View
+              style={[
+                styles.badge,
+                {
+                  backgroundColor: statusMeta.backgroundColor,
+                  borderColor: statusMeta.borderColor,
+                },
+              ]}
+            >
+              <Text style={styles.badgeText}>{statusMeta.label}</Text>
+            </View>
+          </View>
+        </View>
+
+        <Text style={styles.queueLabel}>Case note</Text>
+        <Text style={styles.queueValue}>{reasonMeta.queueSummary}</Text>
+
+        <Text style={styles.queueLabel}>Who is involved</Text>
+        <Text style={styles.queueValue}>
+          {report.reporter_role} reporting {report.reported_role}
+        </Text>
+
+        <Text style={styles.queueLabel}>Submitted</Text>
+        <Text style={styles.queueValue}>{formatTimestamp(report.created_at)}</Text>
+
+        <Text style={styles.queueLabel}>Details</Text>
+        <Text style={styles.queueValue}>
+          {report.description || "No extra details were included."}
+        </Text>
+
+        <View style={styles.actionRow}>
+          <AppButton
+            title="View Case"
+            onPress={() => setFocusedComplaint(report)}
+            style={styles.inlineAction}
+          />
+        </View>
+      </View>
+    );
+  };
+
+  const handleExportCsv = async () => {
+    const csv = buildCsvContent(
+      filteredHistoryOrders,
+      dashboardData.customersById,
+      dashboardData.volunteersById,
+    );
+
+    if (Platform.OS === "web") {
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `fpn-orders-${new Date().toISOString().slice(0, 10)}.csv`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } else {
+      try {
+        await Share.share({ message: csv, title: "FPN Order Export" });
+      } catch (error) {
+        console.error("CSV share failed:", error);
+      }
+    }
+  };
+
+  const renderAnalyticsTab = () => {
+    if (loading) {
+      return <Text style={styles.emptyText}>Loading analytics...</Text>;
+    }
+
+    const totalOrders = dashboardData.orders.length;
+    const maxPerDay = Math.max(...ordersPerDay.map((d) => d.count), 1);
+
+    return (
+      <>
+        <Text style={styles.analyticsSectionTitle}>Order Status Breakdown</Text>
+        {Object.entries(ordersByStatus).map(([status, count]) => {
+          const pct = totalOrders > 0 ? Math.round((count / totalOrders) * 100) : 0;
+          return (
+            <View key={status} style={styles.statRow}>
+              <Text style={styles.statLabel}>{status.replace(/_/g, " ")}</Text>
+              <View style={styles.statBarTrack}>
+                <View style={[styles.statBarFill, { width: `${pct}%` }]} />
+              </View>
+              <Text style={styles.statValue}>{count}</Text>
+            </View>
+          );
+        })}
+
+        <Text style={[styles.analyticsSectionTitle, styles.analyticsSectionSpacing]}>
+          Orders per Day (last 7 days)
+        </Text>
+        {ordersPerDay.map((day) => {
+          const barPct = maxPerDay > 0 ? Math.round((day.count / maxPerDay) * 100) : 0;
+          return (
+            <View key={day.label} style={styles.statRow}>
+              <Text style={styles.statLabel}>{day.label}</Text>
+              <View style={styles.statBarTrack}>
+                <View
+                  style={[
+                    styles.statBarFill,
+                    { width: `${barPct}%`, backgroundColor: "#0F766E" },
+                  ]}
+                />
+              </View>
+              <Text style={styles.statValue}>{day.count}</Text>
+            </View>
+          );
+        })}
+
+        <Text style={[styles.analyticsSectionTitle, styles.analyticsSectionSpacing]}>
+          Volunteer Reliability
+        </Text>
+        {volunteerStats.length === 0 ? (
+          <Text style={styles.emptyText}>No volunteer delivery data yet.</Text>
+        ) : (
+          volunteerStats.map((v) => (
+            <View key={v.uid} style={styles.volunteerRow}>
+              <View style={styles.volunteerInfo}>
+                <Text style={styles.volunteerName}>{v.name}</Text>
+                <Text style={styles.volunteerMeta}>
+                  {v.inProgress > 0 ? `${v.inProgress} in progress · ` : ""}
+                  {v.completed} delivered
+                  {v.relinquished > 0 ? ` · ${v.relinquished} released` : ""}
+                </Text>
+              </View>
+              <View style={styles.reliabilityBadge}>
+                <Text style={styles.reliabilityText}>{v.completionRate}%</Text>
+              </View>
+            </View>
+          ))
+        )}
+      </>
+    );
+  };
+
+  const renderHistoryTab = () => {
+    if (loading) {
+      return <Text style={styles.emptyText}>Loading order history...</Text>;
+    }
+
+    return (
+      <>
+        <View style={styles.historyFilterRow}>
+          <View style={styles.historyFilterField}>
+            <Text style={styles.inputLabel}>From</Text>
+            <TextInput
+              style={styles.textInput}
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor={styles.mutedPlaceholder.color}
+              value={historyFilter.from}
+              onChangeText={(v) => setHistoryFilter((f) => ({ ...f, from: v }))}
+            />
+          </View>
+          <View style={styles.historyFilterField}>
+            <Text style={styles.inputLabel}>To</Text>
+            <TextInput
+              style={styles.textInput}
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor={styles.mutedPlaceholder.color}
+              value={historyFilter.to}
+              onChangeText={(v) => setHistoryFilter((f) => ({ ...f, to: v }))}
+            />
+          </View>
+        </View>
+
+        <AppButton
+          title={`Export ${filteredHistoryOrders.length} orders as CSV`}
+          variant="secondary"
+          onPress={() => void handleExportCsv()}
+          style={styles.menuToolbarButton}
+        />
+
+        {filteredHistoryOrders.length === 0 ? (
+          <Text style={[styles.emptyText, { marginTop: 12 }]}>No orders match this date range.</Text>
+        ) : (
+          filteredHistoryOrders.map((order) => {
+            const statusMeta = getOrderStatusBadge(order);
+            const customerLabel = getCustomerLabel(order, dashboardData.customersById);
+            const volunteerLabel = order.volunteer_uid
+              ? dashboardData.volunteersById[order.volunteer_uid]
+              : null;
+
+            return (
+              <View key={order.order_id} style={styles.queueCard}>
+                <View style={styles.queueCardHeader}>
+                  <View style={styles.queueCardTitleBlock}>
+                    <Text style={styles.queueCardTitle}>{customerLabel}</Text>
+                    <Text style={styles.queueCardMeta}>
+                      {formatTimestamp(order.created_at)}
+                    </Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.badge,
+                      {
+                        backgroundColor: statusMeta.backgroundColor,
+                        borderColor: statusMeta.borderColor,
+                      },
+                    ]}
+                  >
+                    <Text style={styles.badgeText}>{statusMeta.label}</Text>
+                  </View>
+                </View>
+                <Text style={styles.queueLabel}>Address</Text>
+                <Text style={styles.queueValue}>{buildAddressSummary(order.delivery_address)}</Text>
+                {volunteerLabel ? (
+                  <>
+                    <Text style={styles.queueLabel}>Volunteer</Text>
+                    <Text style={styles.queueValue}>{volunteerLabel}</Text>
+                  </>
+                ) : null}
+              </View>
+            );
+          })
+        )}
+      </>
+    );
+  };
+
+  const renderActiveQueue = () => {
+    if (activeTab === "menu") {
+      if (loading) {
+        return <Text style={styles.emptyText}>Loading menu sections...</Text>;
+      }
+
+      return (
+        <>
+          <View style={styles.menuSetupToolbar}>
+            <AppButton
+              title="Add Section"
+              variant="secondary"
+              onPress={openCreateSection}
+              style={styles.menuToolbarButton}
+            />
+          </View>
+          <Text style={styles.menuHelperText}>
+            Sections are based on item categories. Hiding keeps older orders
+            readable while removing items from the requester menu.
+          </Text>
+          {menuSections.length === 0 ? (
+            <Text style={styles.emptyText}>
+              No menu sections have been created yet.
+            </Text>
+          ) : (
+            menuSections.map(renderMenuSectionCard)
+          )}
+        </>
+      );
+    }
+
+    if (activeTab === "pantries") {
+      if (loading) {
+        return <Text style={styles.emptyText}>Loading pantry locations...</Text>;
+      }
+
+      return (
+        <>
+          <View style={styles.menuSetupToolbar}>
+            <AppButton
+              title="Add Pantry"
+              variant="secondary"
+              onPress={openCreatePantry}
+              style={styles.menuToolbarButton}
+            />
+          </View>
+          {dashboardData.pantries.length === 0 ? (
+            <Text style={styles.emptyText}>
+              No pantry locations have been added yet.
+            </Text>
+          ) : (
+            dashboardData.pantries.map(renderPantryCard)
+          )}
+        </>
+      );
+    }
+
+    if (activeTab === "cancellations") {
+      if (loading) {
+        return <Text style={styles.emptyText}>Loading cancellable orders...</Text>;
+      }
+
+      if (cancellationQueue.length === 0) {
+        return (
+          <Text style={styles.emptyText}>
+            No pending or accepted orders are flagged for cancellation.
+          </Text>
+        );
+      }
+
+      return cancellationQueue.map(renderCancellationCard);
+    }
+
+    if (activeTab === "analytics") {
+      return renderAnalyticsTab();
+    }
+
+    if (activeTab === "history") {
+      return renderHistoryTab();
+    }
+
+    if (loading) {
+      return <Text style={styles.emptyText}>Loading complaints...</Text>;
+    }
+
+    if (complaintQueue.length === 0) {
+      return (
+        <Text style={styles.emptyText}>
+          No open complaints are waiting for review.
+        </Text>
+      );
+    }
+
+    return complaintQueue.map(renderComplaintCard);
+  };
+
+  const focusedComplaintMeta = focusedComplaint
+    ? getReportReasonMeta(focusedComplaint.reason)
+    : null;
+  const focusedComplaintStatusMeta = focusedComplaint
+    ? getReportStatusMeta(focusedComplaint.status)
+    : null;
+  const focusedComplaintOrder = focusedComplaint
+    ? ordersById[focusedComplaint.order_id]
+    : null;
+  const focusedComplaintOrderSummary = focusedComplaintOrder
+    ? getOrderSummary(focusedComplaintOrder)
+    : null;
+
+  if (!authReady) {
+    return (
+      <View style={styles.authShell}>
+        <View style={styles.authCard}>
+          <Text style={styles.eyebrow}>Admin Access</Text>
+          <Text style={styles.title}>Checking admin session...</Text>
+          <Text style={styles.subtitle}>
+            Looking for a saved sign-in on this device.
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        style={styles.authShell}
+      >
+        <View style={styles.authCard}>
+          <Text style={styles.eyebrow}>Admin Access</Text>
+          <Text style={styles.title}>Pantry dashboard sign-in</Text>
+          <Text style={styles.subtitle}>
+            Use your administrator credentials to open queue, menu, and report tools.
+          </Text>
+
+          <Text style={styles.inputLabel}>Username</Text>
+          <TextInput
+            style={styles.textInput}
+            placeholder="admin"
+            placeholderTextColor={theme.colors.mutedText}
+            value={credentials.username}
+            onChangeText={(text) => {
+              setCredentials((current) => ({
+                ...current,
+                username: text,
+              }));
+              if (loginError) {
+                setLoginError("");
+              }
+            }}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!authBusy}
+            returnKeyType="next"
+          />
+
+          <Text style={[styles.inputLabel, styles.authPasswordLabel]}>Password</Text>
+          <TextInput
+            style={styles.textInput}
+            placeholder="password"
+            placeholderTextColor={theme.colors.mutedText}
+            value={credentials.password}
+            onChangeText={(text) => {
+              setCredentials((current) => ({
+                ...current,
+                password: text,
+              }));
+              if (loginError) {
+                setLoginError("");
+              }
+            }}
+            autoCapitalize="none"
+            autoCorrect={false}
+            secureTextEntry
+            editable={!authBusy}
+            onSubmitEditing={() => {
+              void handleLogin();
+            }}
+          />
+
+          {loginError ? <Text style={styles.authErrorText}>{loginError}</Text> : null}
+
+          <View style={styles.authActions}>
+            <AppButton
+              title={authBusy ? "Signing In..." : "Sign In"}
+              onPress={() => {
+                void handleLogin();
+              }}
+              disabled={authBusy}
+              style={styles.modalActionButton}
+            />
+            <AppButton
+              title="Back Home"
+              variant="ghost"
+              onPress={() => router.replace("/mode-select")}
+              disabled={authBusy}
+              style={styles.modalActionButton}
+            />
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
+      >
+        <View style={styles.hero}>
+          <View style={styles.heroCopy}>
+            <Text style={styles.eyebrow}>Pantry Admin</Text>
+            <Text style={styles.title}>Operations dashboard</Text>
+            <Text style={styles.subtitle}>
+              Menu availability, open issues, delivery queue, and recent activity.
+            </Text>
+            <View style={styles.heroNote}>
+              <Text style={styles.heroNoteText}>{queueHeadline}</Text>
+            </View>
+            <Text style={styles.lastUpdatedText}>
+              Last refreshed {lastRefreshedAt ? formatElapsedSince(lastRefreshedAt) : "just now"}
+            </Text>
+          </View>
+          <View style={styles.heroActions}>
+            <AppButton
+              title="Refresh"
+              onPress={onRefresh}
+              variant="secondary"
+              style={styles.heroButton}
+              disabled={loading || refreshing}
+            />
+            <AppButton
+              title="Back Home"
+              onPress={() => router.push("/mode-select")}
+              variant="ghost"
+              style={styles.heroButton}
+            />
+            <AppButton
+              title="Log Out"
+              onPress={() => {
+                void handleLogout();
+              }}
+              variant="danger"
+              style={styles.heroButton}
+              disabled={authBusy}
+            />
+          </View>
+        </View>
+
+        <View style={styles.metricsGrid}>
+          {metricCards.map((card) => (
+            <View key={card.key} style={styles.metricCard}>
+              <View
+                style={[
+                  styles.metricAccent,
+                  { backgroundColor: card.accent },
+                ]}
+              />
+              <Text style={styles.metricValue}>{card.value}</Text>
+              <Text style={styles.metricLabel}>{card.label}</Text>
+            </View>
+          ))}
+        </View>
+
+        <View style={styles.segmentedControl}>
+          {ADMIN_TABS.map((tab) => {
+            const isActive = activeTab === tab.key;
+
+            return (
+              <TouchableOpacity
+                key={tab.key}
+                style={[
+                  styles.segmentButton,
+                  isActive ? styles.segmentButtonActive : null,
+                ]}
+                onPress={() => setActiveTab(tab.key)}
+                activeOpacity={0.8}
+              >
+                <Text
+                  style={[
+                    styles.segmentText,
+                    isActive ? styles.segmentTextActive : null,
+                  ]}
+                >
+                  {tab.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        <View style={styles.sectionCard}>
+          <Text style={styles.sectionTitle}>{currentTabCopy.title}</Text>
+          <Text style={styles.sectionSubtitle}>{currentTabCopy.subtitle}</Text>
+          {renderActiveQueue()}
+        </View>
+      </ScrollView>
+
+      <Modal
+        visible={Boolean(sectionEditor)}
+        transparent
+        animationType="slide"
+        onRequestClose={itemEditor ? closeItemEditor : closeSectionEditor}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalOverlay}
+        >
+          <View style={styles.modalCard}>
+            {sectionEditor ? (
+              <>
+                <View style={styles.modalHeader}>
+                  <View style={styles.modalTitleBlock}>
+                    <Text style={styles.modalTitle}>
+                      {itemEditor
+                        ? itemEditor.mode === "create"
+                          ? "Add menu item"
+                          : "Rename item"
+                        : sectionEditor.mode === "create"
+                          ? "Create menu section"
+                          : "Edit section"}
+                    </Text>
+                    <Text style={styles.modalSubtitle}>
+                      {itemEditor
+                        ? itemEditor.sectionName
+                        : sectionEditor.mode === "create"
+                          ? "Start a section with one visible item."
+                          : `Saved as ${sectionEditor.originalName}.`}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={itemEditor ? closeItemEditor : closeSectionEditor}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.modalClose}>Close</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView
+                  contentContainerStyle={styles.modalContent}
+                  showsVerticalScrollIndicator={false}
+                >
+                  {itemEditor ? (
+                    <>
+                      <Text style={styles.inputLabel}>Item label</Text>
+                      <TextInput
+                        style={styles.textInput}
+                        placeholder="Sports drink"
+                        placeholderTextColor={theme.colors.mutedText}
+                        value={itemEditor.label}
+                        onChangeText={(text) =>
+                          setItemEditor((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  label: text,
+                                }
+                              : current,
+                          )
+                        }
+                      />
+
+                      <View style={styles.modalActions}>
+                        <AppButton
+                          title={itemEditor.mode === "create" ? "Add Item" : "Save Item"}
+                          onPress={handleSaveItem}
+                          disabled={busyKey === "item-save"}
+                          style={styles.modalActionButton}
+                        />
+                        <AppButton
+                          title="Back to Section"
+                          variant="ghost"
+                          onPress={closeItemEditor}
+                          disabled={busyKey === "item-save"}
+                          style={styles.modalActionButton}
+                        />
+                      </View>
+                    </>
+                  ) : null}
+
+                  {!itemEditor ? (
+                    <>
+                      <Text style={styles.inputLabel}>Section name</Text>
+                      <TextInput
+                        style={styles.textInput}
+                        placeholder="Diet Restrictions"
+                        placeholderTextColor={theme.colors.mutedText}
+                        value={sectionEditor.name}
+                        onChangeText={(text) =>
+                          setSectionEditor((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  name: text,
+                                }
+                              : current,
+                          )
+                        }
+                      />
+
+                      {sectionEditor.mode === "create" ? (
+                        <>
+                          <Text style={styles.menuHelperText}>
+                            Sections come from item categories, so the first item
+                            creates the section.
+                          </Text>
+                          <Text style={styles.inputLabel}>First item label</Text>
+                          <TextInput
+                            style={styles.textInput}
+                            placeholder="Protein shake"
+                            placeholderTextColor={theme.colors.mutedText}
+                            value={sectionEditor.firstItemLabel}
+                            onChangeText={(text) =>
+                              setSectionEditor((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      firstItemLabel: text,
+                                    }
+                                  : current,
+                              )
+                            }
+                          />
+                        </>
+                      ) : currentSection ? (
+                        <>
+                          <View style={styles.sectionSummaryCard}>
+                            <Text style={styles.queueLabel}>Section status</Text>
+                            <Text style={styles.queueValue}>
+                              {currentSection.isVisible
+                                ? `${currentSection.activeItemCount} live item${currentSection.activeItemCount === 1 ? "" : "s"} visible to requesters.`
+                                : "All items in this section are hidden right now."}
+                            </Text>
+                            <Text style={styles.queueLabel}>Hidden items</Text>
+                            <Text style={styles.queueValue}>
+                              {currentSection.inactiveItemCount} hidden item
+                              {currentSection.inactiveItemCount === 1 ? "" : "s"}.
+                            </Text>
+                          </View>
+
+                          <View style={styles.actionRow}>
+                            <AppButton
+                              title="Add Item"
+                              variant="secondary"
+                              onPress={() => openCreateItem(currentSection.name)}
+                              style={styles.inlineAction}
+                            />
+                            <AppButton
+                              title={currentSection.isVisible ? "Hide Section" : "Restore All"}
+                              variant="ghost"
+                              onPress={() =>
+                                performSectionVisibilityUpdate(
+                                  currentSection,
+                                  !currentSection.isVisible,
+                                )
+                              }
+                              disabled={busyKey === `section-toggle-${currentSection.name}`}
+                              style={styles.inlineAction}
+                            />
+                          </View>
+
+                          <Text style={styles.sectionItemsTitle}>Items in this section</Text>
+                          {currentSection.items.map((item) => (
+                            <View key={item.id} style={styles.itemRowCard}>
+                              <View style={styles.itemRowTop}>
+                                <View style={styles.itemRowText}>
+                                  <Text style={styles.itemRowTitle}>{item.label}</Text>
+                                  <Text style={styles.itemRowMeta}>
+                                    {item.active
+                                      ? "Visible to requesters"
+                                      : "Hidden from requesters"}
+                                  </Text>
+                                </View>
+                                <View
+                                  style={[
+                                    styles.badge,
+                                    item.active ? styles.badgeVisible : styles.badgeMuted,
+                                  ]}
+                                >
+                                  <Text style={styles.badgeText}>
+                                    {item.active ? "Live" : "Hidden"}
+                                  </Text>
+                                </View>
+                              </View>
+                              <View style={styles.microActionRow}>
+                                <TouchableOpacity
+                                  style={styles.microAction}
+                                  onPress={() => openEditItem(item)}
+                                  activeOpacity={0.8}
+                                >
+                                  <Text style={styles.microActionText}>Rename</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={styles.microAction}
+                                  onPress={() =>
+                                    handleToggleItemVisibility(item, !item.active)
+                                  }
+                                  activeOpacity={0.8}
+                                  disabled={busyKey === `item-toggle-${item.id}`}
+                                >
+                                  <Text style={styles.microActionText}>
+                                    {item.active ? "Hide" : "Restore"}
+                                  </Text>
+                                </TouchableOpacity>
+                              </View>
+                            </View>
+                          ))}
+                        </>
+                      ) : null}
+
+                      <View style={styles.modalActions}>
+                        <AppButton
+                          title={
+                            sectionEditor.mode === "create"
+                              ? "Create Section"
+                              : "Save Section"
+                          }
+                          onPress={handleSaveSection}
+                          disabled={busyKey === "section-save"}
+                          style={styles.modalActionButton}
+                        />
+                        <AppButton
+                          title="Close"
+                          variant="ghost"
+                          onPress={closeSectionEditor}
+                          disabled={busyKey === "section-save"}
+                          style={styles.modalActionButton}
+                        />
+                      </View>
+                    </>
+                  ) : null}
+                </ScrollView>
+              </>
+            ) : null}
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      <Modal
+        visible={Boolean(focusedComplaint)}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setFocusedComplaint(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            {focusedComplaint && focusedComplaintMeta && focusedComplaintStatusMeta ? (
+              <>
+                <View style={styles.modalHeader}>
+                  <View style={styles.modalTitleBlock}>
+                    <Text style={styles.modalTitle}>{focusedComplaintMeta.label}</Text>
+                    <Text style={styles.modalSubtitle}>
+                      Order #{focusedComplaint.order_id} • {formatTimestamp(focusedComplaint.created_at)}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => setFocusedComplaint(null)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.modalClose}>Close</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.complaintDetailBadges}>
+                  <View
+                    style={[
+                      styles.badge,
+                      {
+                        backgroundColor: focusedComplaintMeta.backgroundColor,
+                        borderColor: focusedComplaintMeta.borderColor,
+                      },
+                    ]}
+                  >
+                    <Text style={styles.badgeText}>
+                      {focusedComplaintMeta.severity} severity
+                    </Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.badge,
+                      {
+                        backgroundColor: focusedComplaintStatusMeta.backgroundColor,
+                        borderColor: focusedComplaintStatusMeta.borderColor,
+                      },
+                    ]}
+                  >
+                    <Text style={styles.badgeText}>
+                      {focusedComplaintStatusMeta.label}
+                    </Text>
+                  </View>
+                </View>
+
+                <ScrollView contentContainerStyle={styles.modalContent}>
+                  <Text style={styles.queueLabel}>Who is involved</Text>
+                  <Text style={styles.queueValue}>
+                    {focusedComplaint.reporter_role} reporting{" "}
+                    {focusedComplaint.reported_role}
+                  </Text>
+
+                  <Text style={styles.queueLabel}>Handling note</Text>
+                  <Text style={styles.queueValue}>
+                    {focusedComplaintMeta.queueSummary}
+                  </Text>
+
+                  <Text style={styles.queueLabel}>Complaint details</Text>
+                  <Text style={styles.queueValue}>
+                    {focusedComplaint.description || "No extra details were included."}
+                  </Text>
+
+                  {focusedComplaintOrder ? (
+                    <>
+                      <Text style={styles.queueLabel}>Related order status</Text>
+                      <Text style={styles.queueValue}>
+                        {getOrderStatusBadge(focusedComplaintOrder).label} •{" "}
+                        {getCustomerLabel(
+                          focusedComplaintOrder,
+                          dashboardData.customersById,
+                        )}
+                      </Text>
+
+                      <Text style={styles.queueLabel}>Order snapshot</Text>
+                      <Text style={styles.queueValue}>
+                        {focusedComplaintOrderSummary?.boxCount || 1} box
+                        {(focusedComplaintOrderSummary?.boxCount || 1) === 1 ? "" : "es"}{" "}
+                        •{" "}
+                        {focusedComplaintOrderSummary?.itemLabels?.length
+                          ? focusedComplaintOrderSummary.itemLabels.join(", ")
+                          : "No item selections saved yet."}
+                      </Text>
+                    </>
+                  ) : null}
+
+                  <View style={styles.modalActions}>
+                    <AppButton
+                      title="Resolve"
+                      onPress={() =>
+                        handleSetReportStatus(focusedComplaint, "resolved")
+                      }
+                      disabled={
+                        busyKey === `report-${focusedComplaint.order_id}-resolved`
+                      }
+                      style={styles.modalActionButton}
+                    />
+                  </View>
+                </ScrollView>
+              </>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={Boolean(pantryEditor)}
+        transparent
+        animationType="slide"
+        onRequestClose={closePantryEditor}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalOverlay}
+        >
+          <View style={styles.modalCard}>
+            {pantryEditor ? (
+              <>
+                <View style={styles.modalHeader}>
+                  <View style={styles.modalTitleBlock}>
+                    <Text style={styles.modalTitle}>
+                      {pantryEditor.mode === "create" ? "Add pantry" : "Edit pantry"}
+                    </Text>
+                    <Text style={styles.modalSubtitle}>
+                      {pantryEditor.mode === "create"
+                        ? "New locations appear on the volunteer map once active."
+                        : "Changes take effect after the volunteer app refreshes."}
+                    </Text>
+                  </View>
+                  <TouchableOpacity onPress={closePantryEditor} activeOpacity={0.7}>
+                    <Text style={styles.modalClose}>Close</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView
+                  contentContainerStyle={styles.modalContent}
+                  showsVerticalScrollIndicator={false}
+                >
+                  <Text style={styles.inputLabel}>Name</Text>
+                  <TextInput
+                    style={styles.textInput}
+                    placeholder="Christ Cornerstone Church"
+                    placeholderTextColor={theme.colors.mutedText}
+                    value={pantryEditor.name}
+                    onChangeText={(text) =>
+                      setPantryEditor((p) => p ? { ...p, name: text } : p)
+                    }
+                  />
+
+                  <Text style={[styles.inputLabel, { marginTop: theme.spacing.md }]}>
+                    Address
+                  </Text>
+                  <TextInput
+                    style={styles.textInput}
+                    placeholder="69 King Avenue, Newark, OH 43055"
+                    placeholderTextColor={theme.colors.mutedText}
+                    value={pantryEditor.address}
+                    onChangeText={(text) =>
+                      setPantryEditor((p) => p ? { ...p, address: text } : p)
+                    }
+                  />
+
+                  <Text style={[styles.inputLabel, { marginTop: theme.spacing.md }]}>
+                    Hours
+                  </Text>
+                  <TextInput
+                    style={styles.textInput}
+                    placeholder="Weds: 4:30–6pm"
+                    placeholderTextColor={theme.colors.mutedText}
+                    value={pantryEditor.hours}
+                    onChangeText={(text) =>
+                      setPantryEditor((p) => p ? { ...p, hours: text } : p)
+                    }
+                  />
+
+                  <View style={styles.modalActions}>
+                    <AppButton
+                      title={pantryEditor.mode === "create" ? "Add Pantry" : "Save Changes"}
+                      onPress={handleSavePantry}
+                      disabled={busyKey === "pantry-save"}
+                      style={styles.modalActionButton}
+                    />
+                    <AppButton
+                      title="Close"
+                      variant="ghost"
+                      onPress={closePantryEditor}
+                      disabled={busyKey === "pantry-save"}
+                      style={styles.modalActionButton}
+                    />
+                  </View>
+                </ScrollView>
+              </>
+            ) : null}
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: theme.colors.background,
+  },
+  authShell: {
+    flex: 1,
+    justifyContent: "center",
+    padding: theme.spacing.lg,
+    backgroundColor: theme.colors.background,
+  },
+  authCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.xl,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.xl,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.1,
+    shadowRadius: 20,
+    shadowOffset: {
+      width: 0,
+      height: 12,
+    },
+    elevation: 4,
+  },
+  authPasswordLabel: {
+    marginTop: theme.spacing.lg,
+  },
+  authErrorText: {
+    marginTop: theme.spacing.md,
+    fontSize: 14,
+    color: theme.colors.errorText,
+  },
+  authActions: {
+    gap: theme.spacing.md,
+    marginTop: theme.spacing.xl,
+  },
+  content: {
+    padding: theme.spacing.lg,
+    paddingBottom: theme.spacing.xxl,
+  },
+  hero: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.xl,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.xl,
+    marginBottom: theme.spacing.lg,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowRadius: 18,
+    shadowOffset: {
+      width: 0,
+      height: 10,
+    },
+    elevation: 3,
+  },
+  heroCopy: {
+    marginBottom: theme.spacing.lg,
+  },
+  heroActions: {
+    flexDirection: "column",
+    flexWrap: "wrap",
+    gap: theme.spacing.sm,
+  },
+  heroButton: {
+    flex: 1,
+    width: "100%",
+    shadowColor: "#000",
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  
+  eyebrow: {
+    color: theme.colors.primary,
+    fontSize: 13,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 1.2,
+    marginBottom: theme.spacing.sm,
+  },
+  title: {
+    fontSize: 30,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.sm,
+    lineHeight: 38,
+  },
+  subtitle: {
+    fontSize: 15,
+    color: theme.colors.mutedText,
+    lineHeight: 22,
+  },
+  heroNote: {
+    marginTop: theme.spacing.lg,
+    backgroundColor: theme.colors.surfaceMuted,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.md,
+  },
+  heroNoteText: {
+    color: theme.colors.text,
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: "600",
+  },
+  lastUpdatedText: {
+    marginTop: theme.spacing.sm,
+    fontSize: 13,
+    color: theme.colors.mutedText,
+  },
+  metricsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: theme.spacing.md,
+    marginBottom: theme.spacing.lg,
+  },
+  metricCard: {
+    width: "48%",
+    minWidth: 150,
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.lg,
+  },
+  metricAccent: {
+    width: 44,
+    height: 6,
+    borderRadius: theme.radius.pill,
+    marginBottom: theme.spacing.md,
+  },
+  metricValue: {
+    fontSize: 28,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.xs,
+  },
+  metricLabel: {
+    fontSize: 14,
+    color: theme.colors.mutedText,
+    lineHeight: 20,
+  },
+  segmentedControl: {
+    flexDirection: "row",
+    gap: theme.spacing.sm,
+    flexWrap: "wrap",
+    marginBottom: theme.spacing.lg,
+  },
+  segmentButton: {
+    width: "47%",
+    //flex: 1,
+    paddingVertical: theme.spacing.sm,
+    paddingHorizontal: theme.spacing.sm,
+    borderRadius: theme.radius.pill,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 36,
+  },
+  segmentButtonActive: {
+    backgroundColor: theme.colors.primary,
+    borderColor: theme.colors.primary,
+  },
+  segmentText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: theme.colors.text,
+    textAlign: "center",
+  },
+  segmentTextActive: {
+    color: theme.colors.primaryText,
+  },
+  sectionCard: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.xl,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.xl,
+  },
+  sectionTitle: {
+    fontSize: 22,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.xs,
+  },
+  sectionSubtitle: {
+    fontSize: 14,
+    color: theme.colors.mutedText,
+    lineHeight: 21,
+    marginBottom: theme.spacing.lg,
+  },
+  menuSetupToolbar: {
+    marginBottom: theme.spacing.md,
+  },
+  menuToolbarButton: {
+    width: "100%",
+  },
+  menuHelperText: {
+    fontSize: 13,
+    color: theme.colors.mutedText,
+    lineHeight: 20,
+    marginBottom: theme.spacing.lg,
+  },
+  queueCard: {
+    backgroundColor: theme.colors.surfaceMuted,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.lg,
+    marginBottom: theme.spacing.md,
+  },
+  queueCardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+  },
+  queueCardTitleBlock: {
+    flex: 1,
+  },
+  queueCardTitle: {
+    fontSize: 17,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.xs,
+  },
+  queueCardMeta: {
+    fontSize: 13,
+    color: theme.colors.mutedText,
+  },
+  queueLabel: {
+    fontSize: 12,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    color: theme.colors.labelText,
+    marginBottom: 2,
+    marginTop: theme.spacing.sm,
+  },
+  queueValue: {
+    fontSize: 14,
+    color: theme.colors.text,
+    lineHeight: 20,
+  },
+  badge: {
+    borderRadius: theme.radius.pill,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  badgeVisible: {
+    backgroundColor: theme.colors.successBg,
+    borderColor: theme.colors.successBorder,
+  },
+  badgeMuted: {
+    backgroundColor: "#F8FAFC",
+    borderColor: theme.colors.border,
+  },
+  badgeText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: theme.colors.text,
+    textTransform: "capitalize",
+  },
+  complaintBadges: {
+    alignItems: "flex-end",
+    gap: theme.spacing.sm,
+  },
+  actionRow: {
+    flexDirection: "row",
+    gap: theme.spacing.md,
+    marginTop: theme.spacing.lg,
+  },
+  inlineAction: {
+    flex: 1,
+    shadowCOlor: "#000",
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    elevation: 2,
+  },
+  emptyText: {
+    fontSize: 15,
+    color: theme.colors.mutedText,
+    lineHeight: 22,
+  },
+  modalOverlay: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "rgba(15, 23, 42, 0.45)",
+    padding: theme.spacing.lg,
+  },
+  modalCard: {
+    width: "100%",
+    maxHeight: "90%",
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.radius.xl,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.xl,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+  },
+  modalTitleBlock: {
+    flex: 1,
+  },
+  modalTitle: {
+    fontSize: 22,
+    fontWeight: "700",
+    color: theme.colors.text,
+  },
+  modalSubtitle: {
+    marginTop: theme.spacing.xs,
+    fontSize: 14,
+    color: theme.colors.mutedText,
+    lineHeight: 20,
+  },
+  modalClose: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: theme.colors.primary,
+  },
+  modalContent: {
+    paddingBottom: theme.spacing.sm,
+  },
+  inputLabel: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.sm,
+  },
+  textInput: {
+    minHeight: 54,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surfaceMuted,
+    padding: theme.spacing.md,
+    fontSize: 14,
+    lineHeight: 21,
+    color: theme.colors.text,
+    textAlignVertical: "top",
+  },
+  sectionSummaryCard: {
+    marginTop: theme.spacing.lg,
+    backgroundColor: theme.colors.surfaceMuted,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.md,
+  },
+  sectionItemsTitle: {
+    marginTop: theme.spacing.lg,
+    fontSize: 16,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.md,
+  },
+  itemRowCard: {
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surface,
+    padding: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+  },
+  itemRowTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: theme.spacing.md,
+  },
+  itemRowText: {
+    flex: 1,
+  },
+  itemRowTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.xs,
+  },
+  itemRowMeta: {
+    fontSize: 13,
+    color: theme.colors.mutedText,
+    lineHeight: 19,
+  },
+  microActionRow: {
+    flexDirection: "row",
+    gap: theme.spacing.sm,
+    marginTop: theme.spacing.md,
+  },
+  microAction: {
+    paddingHorizontal: theme.spacing.md,
+    paddingVertical: theme.spacing.sm,
+    borderRadius: theme.radius.pill,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surfaceMuted,
+  },
+  microActionText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: theme.colors.text,
+  },
+  modalActions: {
+    gap: theme.spacing.md,
+    marginTop: theme.spacing.lg,
+  },
+  modalActionButton: {
+    width: "100%",
+  },
+  complaintDetailBadges: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: theme.spacing.sm,
+    marginBottom: theme.spacing.md,
+  },
+  analyticsSectionTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: theme.spacing.md,
+  },
+  analyticsSectionSpacing: {
+    marginTop: theme.spacing.xl,
+  },
+  statRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing.md,
+    marginBottom: theme.spacing.sm,
+  },
+  statLabel: {
+    width: 90,
+    fontSize: 13,
+    color: theme.colors.mutedText,
+    textTransform: "capitalize",
+  },
+  statBarTrack: {
+    flex: 1,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: theme.colors.surfaceMuted,
+    overflow: "hidden",
+  },
+  statBarFill: {
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: theme.colors.secondary,
+  },
+  statValue: {
+    width: 30,
+    fontSize: 13,
+    fontWeight: "700",
+    color: theme.colors.text,
+    textAlign: "right",
+  },
+  volunteerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: theme.colors.surfaceMuted,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    padding: theme.spacing.md,
+    marginBottom: theme.spacing.sm,
+  },
+  volunteerInfo: {
+    flex: 1,
+  },
+  volunteerName: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: theme.colors.text,
+    marginBottom: 2,
+  },
+  volunteerMeta: {
+    fontSize: 13,
+    color: theme.colors.mutedText,
+  },
+  reliabilityBadge: {
+    backgroundColor: theme.colors.successBg,
+    borderRadius: theme.radius.pill,
+    borderWidth: 1,
+    borderColor: theme.colors.successBorder,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    minWidth: 50,
+    alignItems: "center",
+  },
+  reliabilityText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: theme.colors.successText,
+  },
+  historyFilterRow: {
+    flexDirection: "row",
+    gap: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+  },
+  historyFilterField: {
+    flex: 1,
+  },
+  mutedPlaceholder: {
+    color: theme.colors.mutedText,
+  },
+
+  pantryActionRow: {
+    flexDirection: "column",
+    gap: theme.spacing.sm,
+    marginTop: theme.spacing.lg,
+    shadowColor: "#000",
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+});
+
