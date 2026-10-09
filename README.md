@@ -102,4 +102,4 @@ This was built as a course project, not for production. The admin dashboard uses
 
 ## Credits
 
-Built by Team Delivery: Safal, Hamdan, Max, Beck and Nhien. The original repository is private to the team. This copy is published with the team's permission, without the commit history.
+Built by Team Delivery: Safal, Hamdan, Ethan, Max, Beck and Nhien. The original repository is private to the team. This copy is published with the team's permission, without the commit history.
