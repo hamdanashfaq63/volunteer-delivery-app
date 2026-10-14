@@ -48,7 +48,6 @@ Expo, React Native, Expo Router, Supabase (Postgres, auth, realtime, storage), N
 
 ```
 .
-├── Sprint5_Report.pptx          final sprint report
 └── volunteer-delivery-app/
     ├── app/                     Expo Router screens
     ├── components/              shared UI and map views
