@@ -8,6 +8,10 @@
 
 Team project for CS 349, Denison University, Spring 2026 · Team Delivery: Safal, Hamdan, Max, Beck and Nhien
 
+![FPN Delivery screens: landing page, volunteer dashboard with open orders, and an accepted delivery](assets/screens.png)
+
+*Landing page, volunteer dashboard with open orders broken down by box, and an accepted delivery. Shown with demo data.*
+
 Some pantry clients in Licking County, Ohio can't get to a pantry in person. FPN Delivery lets them order groceries from their phone and have a volunteer driver bring them home. The app has three roles:
 
 * **Requesters** sign in with their phone number and date of birth, confirm a code sent by SMS, build an order from the pantry's boxes and items, and track the delivery live.
