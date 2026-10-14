@@ -6,7 +6,7 @@
 ![Supabase](https://img.shields.io/badge/backend-Supabase-3ECF8E)
 ![tests](https://img.shields.io/badge/tests-Jest%20%2B%20Playwright-8A2BE2)
 
-Team project for CS 349, Denison University, Spring 2026 · Team Delivery: Safal, Hamdan, Max, Beck and Nhien
+Team project for CS 349, Denison University, Spring 2026 · Team Delivery: Safal, Hamdan, Ethan, Max, Beck and Nhien
 
 ![FPN Delivery screens: landing page, volunteer dashboard with open orders, and an accepted delivery](assets/screens.png)
 
