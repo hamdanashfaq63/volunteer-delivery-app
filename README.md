@@ -20,13 +20,26 @@ Some pantry clients in Licking County, Ohio can't get to a pantry in person. FPN
 
 ## My contributions
 
-I worked on the volunteer side of the app, building on Safal's dashboard UI:
+I learned React Native, Expo and Supabase from scratch for this project and contributed in every sprint, across the frontend, notifications and parts of the backend.
 
-* Showed each order's box and item contents before a volunteer commits to it, with a per-box breakdown in the order card and detail view.
-* Simplified volunteer sign-in to email only and removed an unused username path.
-* Separated the status text volunteers see from the text customers see.
-* Reworked the location update into a clear "Share My Location with Customer" action.
-* Restored the SMS that tells a customer when a volunteer accepts their order.
+**Sign in and navigation**
+* Built the sign in screen with Supabase Auth, the mode selection screen, and the shared Supabase client the whole team used.
+* Built the post login navigation and role routing: the Volunteer Portal, the requester login screen, and the disclaimer modal.
+* Fixed a navigation persistence bug and a double initialization bug in the root layout.
+
+**Notifications, from push to SMS**
+* Implemented push notifications with expo-notifications, a `push_tokens` table in Supabase, and Realtime triggers for when an order is created, accepted or delivered.
+* When push stalled (iOS needs a paid developer account, and Expo Go dropped remote push in SDK 53), I moved the team to SMS. Twilio needed A2P 10DLC carrier registration that takes weeks, so I switched to TextBelt, which handles registration itself. Customers now get a real text when a volunteer accepts their order.
+* Restored the SMS triggers after they were lost in a merge.
+
+**Volunteer experience**
+* Added the box preview, so volunteers see each order's boxes and items before accepting it.
+* Added live GPS location sharing during a delivery with `watchPositionAsync`, behind a clear "Share My Location with Customer" action.
+* Simplified volunteer sign in to email only and separated the status text volunteers see from what customers see.
+
+**Build and backend**
+* Set up the EAS build configuration for iOS and Android builds.
+* Stepped in on backend work when the team needed it: SQL queries, Supabase tables and Realtime subscriptions.
 
 ## How it works
 
